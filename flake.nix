@@ -12,24 +12,6 @@
         pkgs = nixpkgs.legacyPackages.${system};
         python = pkgs.python312;
 
-        # `weave` (wandb/weave) is not packaged in nixpkgs.
-        # The import in src/loader.py is used only for optional observability tracing;
-        # this patch makes it a soft dependency so the package builds without it.
-        optionalWeavePatch = pkgs.writeText "optional-weave.patch" ''
-          --- a/src/loader.py
-          +++ b/src/loader.py
-          @@ -6,7 +6,10 @@ from collections import defaultdict
-
-           import agentops
-           import colorama
-          -import weave
-           from groq import AsyncGroq, Groq
-          +try:
-          +    import weave
-          +except ImportError:
-          +    pass
-           from llama_index.core import Document, SimpleDirectoryReader
-        '';
 
         # agentops is not yet packaged in nixpkgs; build it from PyPI.
         agentops-pkg = python.pkgs.buildPythonPackage rec {
@@ -38,9 +20,10 @@
           pyproject = true;
           src = python.pkgs.fetchPypi {
             inherit pname version;
-            hash = "sha256:1q7aw9kbs55v2r6g2nwsrx6wz63nmjr9vkvazs43cz0pjmnqri3a";
+            hash = "sha256-R3Wcbf1upYutL3dkJX5HeMsuNK4YDO9kL2D1atztZRA=";
           };
-          build-system = [ python.pkgs.setuptools ];
+          build-system = [ python.pkgs.hatchling ];
+          pythonRelaxDeps = true; # agentops upper bounds lag behind nixpkgs
           propagatedBuildInputs = with python.pkgs; [
             aiohttp
             httpx
@@ -67,7 +50,9 @@
           litellm
 
           # Document loading & indexing
-          llama-index
+          # Use llama-index-core instead of the metapackage to avoid a bin/ conflict
+          # between llama-index and llama-index-cli in the Python env.
+          llama-index-core
           chromadb
 
           # Observability (agentops built inline above; weave is optional — see patch)
@@ -104,7 +89,27 @@
 
           format = "other"; # no setup.py / pyproject.toml
 
-          patches = [ optionalWeavePatch ];
+          postPatch = ''
+            # weave (wandb) is not in nixpkgs and not actively called — make it optional.
+            substituteInPlace src/loader.py \
+              --replace-fail 'import weave' \
+'try:
+    import weave
+except ImportError:
+    pass'
+
+            # agentops 0.4+ removed record_function / record_tool.
+            # Inject a no-op shim right after the agentops import.
+            substituteInPlace src/loader.py \
+              --replace-fail 'import agentops' \
+'import agentops
+if not hasattr(agentops, '"'"'record_function'"'"'):
+    def _noop(name):
+        def decorator(f): return f
+        return decorator
+    agentops.record_function = _noop
+    agentops.record_tool = _noop'
+          '';
 
           propagatedBuildInputs = pythonDeps python.pkgs;
 
@@ -120,14 +125,17 @@
             mkdir -p $out/bin
 
             # CLI entry point (batch mode)
+            # PYTHONPATH so Python can find src/*, but no --chdir so the
+            # working directory stays where the user invoked the command
+            # (agentops writes agentops.log to CWD, which must be writable).
             makeWrapper ${pythonEnv}/bin/python $out/bin/llama-fs \
               --add-flags "$out/lib/llama-fs/main.py" \
-              --chdir "$out/lib/llama-fs"
+              --prefix PYTHONPATH : "$out/lib/llama-fs"
 
             # Server entry point (watch / batch API)
+            # --app-dir tells uvicorn where to find server:app without cd.
             makeWrapper ${pythonEnv}/bin/uvicorn $out/bin/llama-fs-server \
-              --add-flags "server:app --host 127.0.0.1 --port 8000" \
-              --chdir "$out/lib/llama-fs"
+              --add-flags "server:app --app-dir $out/lib/llama-fs --host 127.0.0.1 --port 8000"
 
             runHook postInstall
           '';
